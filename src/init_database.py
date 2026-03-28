@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import getpass
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -8,13 +10,23 @@ import psycopg2
 from psycopg2 import sql
 
 
-DEFAULT_DB_CONFIG = {
-    "dbname": "quant_db",
-    "user": "quant_user",
-    "password": "Lkjhg@127",
-    "host": "localhost",
-    "port": 5432,
-}
+def build_db_config(
+    dbname: str | None = None,
+    user: str | None = None,
+    password: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+) -> dict[str, object]:
+    return {
+        "dbname": dbname or os.getenv("QUANT_DB_NAME", "quant_db"),
+        "user": user or os.getenv("QUANT_DB_USER", getpass.getuser()),
+        "password": password if password is not None else os.getenv("QUANT_DB_PASSWORD"),
+        "host": host if host is not None else os.getenv("QUANT_DB_HOST", ""),
+        "port": port if port is not None else int(os.getenv("QUANT_DB_PORT", "5432")),
+    }
+
+
+DEFAULT_DB_CONFIG = build_db_config()
 
 SCHEMA_FILES = [
     Path(__file__).resolve().parent.parent / "sql" / "01_tickers_metadata.sql",
@@ -70,13 +82,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_DB_CONFIG["port"])
     args = parser.parse_args()
 
-    db_config = {
-        "dbname": args.dbname,
-        "user": args.user,
-        "password": args.password,
-        "host": args.host,
-        "port": args.port,
-    }
+    db_config = build_db_config(
+        dbname=args.dbname,
+        user=args.user,
+        password=args.password,
+        host=args.host,
+        port=args.port,
+    )
 
     initialize_database(db_config)
 

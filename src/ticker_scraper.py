@@ -6,17 +6,11 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
 
-from init_database import initialize_database
+from init_database import build_db_config, initialize_database
 
 
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "IWV_holdings25.csv"
-DEFAULT_DB_CONFIG = {
-    "dbname": "quant_db",
-    "user": "quant_user",
-    "password": "Lkjhg@127",
-    "host": "localhost",
-    "port": 5432,
-}
+DEFAULT_DB_CONFIG = build_db_config()
 DEFAULT_SNAPSHOT_DATE = "2025-06-18"
 
 
