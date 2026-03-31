@@ -1,2 +1,5 @@
 pandas
 psycopg2-binary
+yfinance
+cloudscraper
+lxml

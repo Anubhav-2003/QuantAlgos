@@ -681,7 +681,9 @@ insert_universe_to_db(universe)
 
 \section{Phase 2: Price Data via yfinance}
 
-\texttt{yfinance}'s \texttt{download()} function fetches adjusted daily closes for a list of tickers in batched requests. For 2,645 tickers fetching from 2010--01--01 to present, this takes roughly \textbf{30--90 minutes} depending on network speed. Run it once and never again.
+The production loader now lives in \texttt{src/load\_daily\_prices.py}. It reads tickers from \texttt{tickers\_metadata}, downloads daily OHLCV data plus \texttt{adjusted\_close} with \texttt{yfinance}, writes into \texttt{daily\_prices}, and can resume from the latest date already stored.
+
+\texttt{yfinance}'s \texttt{download()} function fetches price history for a list of tickers in batched requests. For 2,645 tickers fetching from 2010--01--01 to present, this takes roughly \textbf{30--90 minutes} depending on network speed. Run it once and then use resume mode for later refreshes.
 
 \begin{lstlisting}[style=pythonstyle, caption={Bulk Price Download via yfinance (2010--Present)}]
 import yfinance as yf
@@ -780,131 +782,24 @@ bulk_download_prices(TICKERS, start="2010-01-01")
 \textbf{Missing Price History for Young Companies.} Companies that IPO'd after 2010 will simply have shorter price history---\texttt{yfinance} returns whatever data exists. This is fine; the WFO engine will exclude a ticker from any window that starts before its IPO date (it will have no data for that period). No special handling required.
 \end{warningbox}
 
-\section{Phase 3: Fundamental Data via yfinance}
+\section{Phase 3: Annual Fundamentals via ROIC.ai}
 
-\texttt{yfinance} exposes quarterly financials via three per-ticker DataFrames. The challenge: unlike prices (where \texttt{download()} is batched), fundamentals must be fetched one ticker at a time. At $\sim$0.5--1 second per ticker, \textbf{2,645 tickers will take 45--90 minutes}. Run it overnight.
+ROIC.ai is now the sole fundamentals source for v1. The AAPL canary check showed a stable annual financials page at \texttt{/quote/AAPL/financials} plus a fallback classic page at \texttt{/quote/AAPL/classic}. The annual tables parse cleanly with \texttt{pandas.read_html}, and for AAPL the visible annual coverage runs from 2011 through 2025. That is enough to seed the loader and validate the pipeline end to end.
 
-\begin{lstlisting}[style=pythonstyle, caption={Quarterly Fundamentals via yfinance (One Ticker at a Time)}]
-import yfinance as yf
-import psycopg2
-from psycopg2.extras import execute_values
-import pandas as pd
-import time
+The implementation lives in \texttt{src/load_roicai_fundamentals.py}. It preloads resume state once, skips tickers that are already complete through the last closed annual year, fetches the remaining tickers in concurrent batches, and commits each batch in a single transaction. That gives us a rerunnable loader that finishes in minutes instead of a serial, one-ticker-at-a-time crawl.
 
-def extract_yf_fundamentals(ticker: str) -> list[dict]:
-    """
-    Fetch quarterly income statement, balance sheet, and cash flow
-    for one ticker from yfinance. Returns a list of dicts,
-    one per quarter.
-    """
-    t = yf.Ticker(ticker)
-
-    try:
-        inc = t.quarterly_financials    # columns = quarter end dates
-        bal = t.quarterly_balance_sheet
-        cf  = t.quarterly_cashflow
-    except Exception:
-        return []
-
-    if inc is None or inc.empty:
-        return []
-
-    records = []
-    for period in inc.columns:  # Each column is a quarter-end date
-        def safe_get(df, row):
-            try:
-                return float(df.loc[row, period]) if row in df.index else None
-            except Exception:
-                return None
-
-        rec = {
-            "ticker":          ticker,
-            "period_end_date": period.date(),
-            "revenue":         safe_get(inc, "Total Revenue"),
-            "gross_profit":    safe_get(inc, "Gross Profit"),
-            "net_income":      safe_get(inc, "Net Income"),
-            "eps_diluted":     safe_get(inc, "Diluted EPS"),
-            "total_assets":    safe_get(bal, "Total Assets"),
-            "total_equity":    safe_get(bal, "Stockholders Equity"),
-            "long_term_debt":  safe_get(bal, "Long Term Debt"),
-            "operating_cf":    safe_get(cf,  "Operating Cash Flow"),
-            "capex":           safe_get(cf,  "Capital Expenditure"),
-        }
-        # Derived fields
-        rec["free_cash_flow"] = (
-            (rec["operating_cf"] or 0) + (rec["capex"] or 0)
-            # yfinance reports capex as negative, so adding gives FCF
-        )
-        records.append(rec)
-
-    return records
-
-def load_all_fundamentals(tickers: list[str]):
-    conn = psycopg2.connect(
-        dbname="quant_db", user="quant_user",
-        password="your_password", host="localhost", port=5432
-    )
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS fundamentals (
-            fundamental_id  BIGSERIAL    PRIMARY KEY,
-            ticker          VARCHAR(12)  REFERENCES tickers_metadata(ticker),
-            period_end_date DATE         NOT NULL,
-            revenue         NUMERIC(18,2),
-            gross_profit    NUMERIC(18,2),
-            net_income      NUMERIC(18,2),
-            eps_diluted     NUMERIC(12,4),
-            total_assets    NUMERIC(18,2),
-            total_equity    NUMERIC(18,2),
-            long_term_debt  NUMERIC(18,2),
-            operating_cf    NUMERIC(18,2),
-            capex           NUMERIC(18,2),
-            free_cash_flow  NUMERIC(18,2),
-            source          VARCHAR(16)  DEFAULT 'YFINANCE',
-            created_at      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (ticker, period_end_date)
-        )
-    """)
-    conn.commit()
-
-    failed = []
-    for i, ticker in enumerate(tickers):
-        if i % 100 == 0:
-            print(f"Progress: {i}/{len(tickers)} ({i/len(tickers)*100:.1f}%)")
-
-        records = extract_yf_fundamentals(ticker)
-        if not records:
-            failed.append(ticker)
-            continue
-
-        rows = [(
-            r["ticker"], r["period_end_date"],
-            r["revenue"], r["gross_profit"], r["net_income"], r["eps_diluted"],
-            r["total_assets"], r["total_equity"], r["long_term_debt"],
-            r["operating_cf"], r["capex"], r["free_cash_flow"]
-        ) for r in records]
-
-        execute_values(cur, """
-            INSERT INTO fundamentals
-                (ticker, period_end_date, revenue, gross_profit, net_income,
-                 eps_diluted, total_assets, total_equity, long_term_debt,
-                 operating_cf, capex, free_cash_flow)
-            VALUES %s
-            ON CONFLICT (ticker, period_end_date) DO NOTHING
-        """, rows)
-        conn.commit()
-        time.sleep(0.3)  # Gentle on yfinance rate limits
-
-    print(f"Done. Failed tickers ({len(failed)}): {failed[:20]}")
-    cur.close()
-    conn.close()
-
-load_all_fundamentals(TICKERS)
+\begin{lstlisting}[style=pythonstyle, caption={Annual Fundamentals via ROIC.ai (Batched and Concurrent)}]
+def load_fundamentals(..., batch_size: int = 80, workers: int = 12):
+    resume_states = load_ticker_states()
+    selected_tickers = prefilter_completed_tickers(selected_tickers, resume_states)
+    for batch in chunked(selected_tickers, batch_size):
+        with ThreadPoolExecutor(max_workers=workers):
+            fetch and parse each ticker in parallel
+        upsert all parsed rows for the batch in one transaction
 \end{lstlisting}
 
 \begin{warningbox}
-\textbf{yfinance Fundamental Coverage.} yfinance typically returns 4--5 years of quarterly history per ticker (going back to around 2019--2020). It does \textbf{not} provide 15 years of quarterly fundamentals back to 2010 for most stocks. This means your WFO windows before $\sim$2019 will have no fundamental signal and cannot generate buy signals. In practice this means your effective backtest window with fundamentals is \textbf{2020--2025}, not 2010--2025. The price data still covers the full window, which is useful for benchmarking returns once a signal fires. If you need pre-2019 fundamentals you must switch to SEC EDGAR XBRL.
+\textbf{ROIC.ai Annual Coverage.} In the AAPL canary test, ROIC.ai exposed annual history from 2011--2025. Exact start year can vary by ticker, so the loader should retain nulls for missing years instead of fabricating values. In practice, many tickers are already complete through 2025, so the loader now skips those before any network work and only revisits the incomplete or unavailable names. The annual-only build is enough to validate the fundamentals pipeline now; if you later want quarterly or strict filing-date correctness, that becomes a separate extension.
 \end{warningbox}
 
 % ============================================================
